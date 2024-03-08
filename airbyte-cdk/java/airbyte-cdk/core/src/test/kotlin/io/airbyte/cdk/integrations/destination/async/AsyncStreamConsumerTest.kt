@@ -312,10 +312,7 @@ class AsyncStreamConsumerTest {
         }
         executor.shutdownNow()
 
-        Assertions.assertTrue(
-            recordCount.get() < 1000,
-            String.format("Record count was %s", recordCount.get()),
-        )
+        Assertions.assertTrue(recordCount.get() < 1000, "Record count was ${recordCount.get()}")
     }
 
     @Test
@@ -343,9 +340,8 @@ class AsyncStreamConsumerTest {
     internal fun deserializeAirbyteMessageWithBigDecimalAirbyteRecord() {
         val payload =
             Jsons.jsonNode(
-                java.util.Map.of(
-                    "foo",
-                    BigDecimal("1234567890.1234567890"),
+                mapOf(
+                    "foo" to BigDecimal("1234567890.1234567890"),
                 ),
             )
         val airbyteMessage =

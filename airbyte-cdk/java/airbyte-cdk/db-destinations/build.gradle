@@ -19,7 +19,7 @@ dependencies {
     compileOnly project(':airbyte-cdk:java:airbyte-cdk:typing-deduping')
 
     implementation 'io.aesy:datasize:1.0.0'
-    
+
     testCompileOnly libs.lombok
     testAnnotationProcessor libs.lombok
 
