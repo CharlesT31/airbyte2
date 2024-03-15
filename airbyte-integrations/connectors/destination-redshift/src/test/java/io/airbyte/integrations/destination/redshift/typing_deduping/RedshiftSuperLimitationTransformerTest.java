@@ -4,29 +4,38 @@
 
 package io.airbyte.integrations.destination.redshift.typing_deduping;
 
-import static io.airbyte.integrations.destination.redshift.typing_deduping.RedshiftSuperLimitationTransformer.DEFAULT_VARCHAR_SIZE_LIMIT_PREDICATE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.airbyte.commons.json.Jsons;
 import io.airbyte.commons.resources.MoreResources;
 import io.airbyte.integrations.base.destination.typing_deduping.AirbyteProtocolType;
 import io.airbyte.integrations.base.destination.typing_deduping.AirbyteType;
-import io.airbyte.integrations.base.destination.typing_deduping.Array;
 import io.airbyte.integrations.base.destination.typing_deduping.ColumnId;
 import io.airbyte.integrations.base.destination.typing_deduping.ParsedCatalog;
 import io.airbyte.integrations.base.destination.typing_deduping.StreamConfig;
 import io.airbyte.integrations.base.destination.typing_deduping.StreamId;
-import io.airbyte.integrations.base.destination.typing_deduping.Struct;
 import io.airbyte.integrations.destination.redshift.RedshiftSQLNameTransformer;
 import io.airbyte.integrations.destination.redshift.typing_deduping.RedshiftSuperLimitationTransformer.TransformationInfo;
+import io.airbyte.protocol.models.v0.AirbyteRecordMessageMeta;
+import io.airbyte.protocol.models.v0.AirbyteRecordMessageMetaChange;
+import io.airbyte.protocol.models.v0.AirbyteRecordMessageMetaChange.Change;
+import io.airbyte.protocol.models.v0.AirbyteRecordMessageMetaChange.Reason;
 import io.airbyte.protocol.models.v0.DestinationSyncMode;
+import io.airbyte.protocol.models.v0.StreamDescriptor;
 import io.airbyte.protocol.models.v0.SyncMode;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.stream.IntStream;
+import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -37,38 +46,22 @@ public class RedshiftSuperLimitationTransformerTest {
 
   @BeforeEach
   public void setup() {
-    StreamId streamId = new StreamId("test_schema", "users_final", "test_schema", "users_raw", "test_schema", "users_final");
-    final ColumnId id1 = redshiftSqlGenerator.buildColumnId("id1");
-    final ColumnId id2 = redshiftSqlGenerator.buildColumnId("id2");
-    final List<ColumnId> primaryKey = List.of(id1, id2);
-    final ColumnId cursor = redshiftSqlGenerator.buildColumnId("updated_at");
-
+    final ColumnId column1 = redshiftSqlGenerator.buildColumnId("column1");
+    final ColumnId column2 = redshiftSqlGenerator.buildColumnId("column2");
+    final List<ColumnId> primaryKey = List.of(column1, column2);
     final LinkedHashMap<ColumnId, AirbyteType> columns = new LinkedHashMap<>();
-    columns.put(id1, AirbyteProtocolType.INTEGER);
-    columns.put(id2, AirbyteProtocolType.INTEGER);
-    columns.put(cursor, AirbyteProtocolType.TIMESTAMP_WITH_TIMEZONE);
-    columns.put(redshiftSqlGenerator.buildColumnId("struct"), new Struct(new LinkedHashMap<>()));
-    columns.put(redshiftSqlGenerator.buildColumnId("array"), new Array(AirbyteProtocolType.UNKNOWN));
-    columns.put(redshiftSqlGenerator.buildColumnId("string"), AirbyteProtocolType.STRING);
-    columns.put(redshiftSqlGenerator.buildColumnId("number"), AirbyteProtocolType.NUMBER);
-    columns.put(redshiftSqlGenerator.buildColumnId("integer"), AirbyteProtocolType.INTEGER);
-    columns.put(redshiftSqlGenerator.buildColumnId("boolean"), AirbyteProtocolType.BOOLEAN);
-    columns.put(redshiftSqlGenerator.buildColumnId("timestamp_with_timezone"), AirbyteProtocolType.TIMESTAMP_WITH_TIMEZONE);
-    columns.put(redshiftSqlGenerator.buildColumnId("timestamp_without_timezone"), AirbyteProtocolType.TIMESTAMP_WITHOUT_TIMEZONE);
-    columns.put(redshiftSqlGenerator.buildColumnId("time_with_timezone"), AirbyteProtocolType.TIME_WITH_TIMEZONE);
-    columns.put(redshiftSqlGenerator.buildColumnId("time_without_timezone"), AirbyteProtocolType.TIME_WITHOUT_TIMEZONE);
-    columns.put(redshiftSqlGenerator.buildColumnId("date"), AirbyteProtocolType.DATE);
-    columns.put(redshiftSqlGenerator.buildColumnId("unknown"), AirbyteProtocolType.UNKNOWN);
-    columns.put(redshiftSqlGenerator.buildColumnId("_ab_cdc_deleted_at"), AirbyteProtocolType.TIMESTAMP_WITH_TIMEZONE);
+    // Generate columnIds from 3 to 1024 and add to columns map
+    IntStream.range(3, 1025).forEach(i -> columns.put(redshiftSqlGenerator.buildColumnId("column" + i), AirbyteProtocolType.STRING));
+
+    final StreamId streamId = new StreamId("test_schema", "users_final", "test_schema", "users_raw", "test_schema", "users_final");
     StreamConfig streamConfig = new StreamConfig(
         streamId,
         SyncMode.INCREMENTAL,
         DestinationSyncMode.APPEND_DEDUP,
         primaryKey,
-        Optional.of(cursor),
+        Optional.empty(),
         columns);
-    ParsedCatalog parsedCatalog = new ParsedCatalog(List.of(streamConfig));
-
+    final ParsedCatalog parsedCatalog = new ParsedCatalog(List.of(streamConfig));
     transformer = new RedshiftSuperLimitationTransformer(parsedCatalog);
   }
 
@@ -91,11 +84,71 @@ public class RedshiftSuperLimitationTransformerTest {
   }
 
   @Test
-  public void testRedshiftVarcharLimitNulling() throws IOException {
-    final String jsonString = MoreResources.readResource("test.json");
-    final JsonNode jsonNode = Jsons.deserializeExact(jsonString);
-    final TransformationInfo transformationInfo =
-        transformer.transformNodes(jsonNode, DEFAULT_VARCHAR_SIZE_LIMIT_PREDICATE);
+  public void testRedshiftSuperLimit_ShouldRemovePartialRecord() throws IOException {
+    // We generate 1020 16Kb strings and 1 64Kb string + 2 uuids.
+    // Removing the 64kb will make it fall below the 16MB limit & offending varchar removed too.
+    final Map<String, String> testData = new HashMap<>();
+    testData.put("column1", UUID.randomUUID().toString());
+    testData.put("column2", UUID.randomUUID().toString());
+    testData.put("column3", getLargeString(64));
+    // Add 16Kb strings from column 3 to 1024 in testData
+    IntStream.range(4, 1025).forEach(i -> testData.put("column" + i, getLargeString(16)));
+
+    AirbyteRecordMessageMeta upstreamMeta = new AirbyteRecordMessageMeta()
+        .withChanges(List.of(
+            new AirbyteRecordMessageMetaChange()
+                .withField("upstream_field")
+                .withChange(Change.NULLED)
+                .withReason(Reason.PLATFORM_SERIALIZATION_ERROR)));
+    final ImmutablePair<JsonNode, AirbyteRecordMessageMeta> transformed =
+        transformer.transform(new StreamDescriptor().withNamespace("test_schema").withName("users_final"), Jsons.jsonNode(testData), upstreamMeta);
+    assertTrue(
+        Jsons.serialize(transformed.left).getBytes(StandardCharsets.UTF_8).length < RedshiftSuperLimitationTransformer.REDSHIFT_SUPER_MAX_BYTE_SIZE);
+    assertEquals(2, transformed.right.getChanges().size());
+    // Assert that transformation added the change
+    assertEquals("$.column3", transformed.right.getChanges().getFirst().getField());
+    assertEquals(Change.NULLED, transformed.right.getChanges().getFirst().getChange());
+    assertEquals(Reason.DESTINATION_FIELD_SIZE_LIMITATION, transformed.right.getChanges().getFirst().getReason());
+    // Assert that upstream changes are preserved (appended last)
+    assertEquals("upstream_field", transformed.right.getChanges().getLast().getField());
+  }
+
+  @Test
+  public void testRedshiftSuperLimit_ShouldRemoveWholeRecord() {
+    // We generate 1020 16Kb strings and 1 64Kb string + 2 uuids.
+    // Removing the 64kb will make it fall below the 16MB limit & offending varchar removed too.
+    final Map<String, String> testData = new HashMap<>();
+    // Add 16Kb strings from column 3 to 1024 in testData
+    IntStream.range(1, 1025).forEach(i -> testData.put("column" + i, getLargeString(16)));
+
+    AirbyteRecordMessageMeta upstreamMeta = new AirbyteRecordMessageMeta()
+        .withChanges(List.of(
+            new AirbyteRecordMessageMetaChange()
+                .withField("upstream_field")
+                .withChange(Change.NULLED)
+                .withReason(Reason.PLATFORM_SERIALIZATION_ERROR)));
+    final ImmutablePair<JsonNode, AirbyteRecordMessageMeta> transformed =
+        transformer.transform(new StreamDescriptor().withNamespace("test_schema").withName("users_final"), Jsons.jsonNode(testData), upstreamMeta);
+    // Verify PKs are preserved.
+    assertNotNull(transformed.left.get("column1"));
+    assertNotNull(transformed.left.get("column1"));
+    assertTrue(
+        Jsons.serialize(transformed.left).getBytes(StandardCharsets.UTF_8).length < RedshiftSuperLimitationTransformer.REDSHIFT_SUPER_MAX_BYTE_SIZE);
+    assertEquals(2, transformed.right.getChanges().size());
+    // Assert that transformation added the change
+    assertEquals("all", transformed.right.getChanges().getFirst().getField());
+    assertEquals(Change.NULLED, transformed.right.getChanges().getFirst().getChange());
+    assertEquals(Reason.DESTINATION_RECORD_SIZE_LIMITATION, transformed.right.getChanges().getFirst().getReason());
+    // Assert that upstream changes are preserved (appended last)
+    assertEquals("upstream_field", transformed.right.getChanges().getLast().getField());
+  }
+
+  private String getLargeString(int kbSize) {
+    StringBuilder longString = new StringBuilder();
+    while (longString.length() < 1024 * kbSize) { // Repeat until the given KB size
+      longString.append("Lorem ipsum dolor sit amet, consectetur adipiscing elit. ");
+    }
+    return longString.toString();
   }
 
 }

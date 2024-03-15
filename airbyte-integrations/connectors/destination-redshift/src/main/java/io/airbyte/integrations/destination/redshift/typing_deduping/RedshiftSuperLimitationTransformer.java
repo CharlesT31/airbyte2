@@ -44,8 +44,8 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
   public static final int REDSHIFT_VARCHAR_MAX_BYTE_SIZE = 65535;
   public static final int REDSHIFT_SUPER_MAX_BYTE_SIZE = 16 * 1024 * 1024;
 
-  static Predicate<String> DEFAULT_VARCHAR_SIZE_LIMIT_PREDICATE = text -> getByteSize(text) > REDSHIFT_VARCHAR_MAX_BYTE_SIZE;
-  static Predicate<Integer> DEFAULT_SUPER_SIZE_LIMIT_PREDICATE = size -> size > REDSHIFT_SUPER_MAX_BYTE_SIZE;
+  final static Predicate<String> DEFAULT_VARCHAR_SIZE_LIMIT_PREDICATE = text -> getByteSize(text) > REDSHIFT_VARCHAR_MAX_BYTE_SIZE;
+  final static Predicate<Integer> DEFAULT_SUPER_SIZE_LIMIT_PREDICATE = size -> size > REDSHIFT_SUPER_MAX_BYTE_SIZE;
 
   private final ParsedCatalog parsedCatalog;
 
@@ -74,19 +74,26 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
     final DestinationSyncMode syncMode = streamConfig.destinationSyncMode();
     final TransformationInfo transformationInfo = transformNodes(jsonNode, varcharPredicate);
     final int originalBytes = transformationInfo.originalBytes;
-    final int actualBytes = transformationInfo.originalBytes - transformationInfo.removedBytes;
-    // We also test for size after removedBytes in case there is few offending
-    // values causing the record to bloat.
-    if (recordSizePredicate.test(originalBytes) || recordSizePredicate.test(actualBytes)) {
+    final int transformedBytes = transformationInfo.originalBytes - transformationInfo.removedBytes;
+    // We check if the transformedBytes has solved the record limit.
+    if (recordSizePredicate.test(originalBytes) && recordSizePredicate.test(transformedBytes)) {
       // If we have reached here with a bunch of small varchars constituted to becoming a large record,
       // person using Redshift for this data should re-evaluate life choices.
-      log.info("Record size before transformation {}, after transformation {} bytes exceeds 16MB limit", originalBytes, actualBytes);
+      log.info("Record size before transformation {}, after transformation {} bytes exceeds 16MB limit", originalBytes, transformedBytes);
       final JsonNode minimalNode = constructMinimalJsonWithPks(jsonNode, primaryKeys, cursorField);
       if (minimalNode.isEmpty() && syncMode == DestinationSyncMode.APPEND_DEDUP) {
         // Fail the sync if PKs are missing in DEDUPE, no point sending an empty record to destination.
         throw new RuntimeException("Record exceeds size limit, cannot transform without PrimaryKeys in DEDUPE sync");
       }
-      return new ImmutablePair<>(minimalNode, null);
+      // Preserve original changes
+      final List<AirbyteRecordMessageMetaChange> changes = new ArrayList<>();
+      changes.add(new AirbyteRecordMessageMetaChange()
+          .withField("all").withChange(Change.NULLED)
+          .withReason(Reason.DESTINATION_RECORD_SIZE_LIMITATION));
+      changes.addAll(airbyteRecordMessageMeta.getChanges());
+      return new ImmutablePair<>(minimalNode,
+          new AirbyteRecordMessageMeta()
+              .withChanges(changes));
     }
     // The underlying list of AirbyteRecordMessageMeta is mutable
     transformationInfo.meta.getChanges().addAll(airbyteRecordMessageMeta.getChanges());
@@ -133,8 +140,7 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
 
     // Walk the tree and transform Varchars that exceed the limit
     // We are intentionally not checking the whole size upfront to check if it exceeds 16MB limit to
-    // optimize
-    // for worst case.
+    // optimize for best case.
     int originalBytes = 0;
     int removedBytes = 0;
     // We keep track of the json path key for adding to airbyte changes.
@@ -162,7 +168,7 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
             final ScalarNodeModification shouldTransform = shouldTransformScalarNode(field.getValue(), textNodePredicate);
             if (shouldTransform.shouldNull()) {
               removedBytes += shouldTransform.removedSize;
-              // DO NOT do this if this code every modified to a multithreaded call stack
+              // DO NOT do this if this code every modified to a multithreading call stack
               field.setValue(Jsons.jsonNode(null));
               changes.add(new AirbyteRecordMessageMetaChange()
                   .withField(jsonPathKey)
@@ -186,7 +192,7 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
             final ScalarNodeModification shouldTransform = shouldTransformScalarNode(childNode, textNodePredicate);
             if (shouldTransform.shouldNull()) {
               removedBytes += shouldTransform.removedSize;
-              // DO NOT do this if this code every modified to a multithreaded call stack
+              // DO NOT do this if this code every modified to a multithreading call stack
               arrayNode.set(i, Jsons.jsonNode(null));
               changes.add(new AirbyteRecordMessageMetaChange()
                   .withField(jsonPathKey)
@@ -221,7 +227,7 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
           if (primaryKeys.contains(field.getKey()) || cursorField.isPresent() && cursorField.get().equals(field.getKey())) {
             // Make a deepcopy into minimalNode of PKs and cursor fields and values,
             // without deepcopy, we will re-reference the original Tree's nodes.
-            // god help us if someone set a PK on non-scalar field and it reached this point, only do at root
+            // god help us if someone set a PK on non-scalar field, and it reached this point, only do at root
             // level
             minimalNode.set(field.getKey(), field.getValue().deepCopy());
           }
