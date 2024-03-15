@@ -71,7 +71,7 @@ public class JdbcBufferedConsumerFactory {
                                                              final ConfiguredAirbyteCatalog catalog,
                                                              final String defaultNamespace,
                                                              final TyperDeduper typerDeduper) {
-    final List<WriteConfig> writeConfigs = createWriteConfigs(namingResolver, config, catalog, sqlOperations.isSchemaRequired());
+    final List<WriteConfig> writeConfigs = createWriteConfigs(namingResolver, config, catalog, sqlOperations.isSchemaRequired);
     return new AsyncStreamConsumer(
         outputRecordCollector,
         onStartFunction(database, sqlOperations, writeConfigs, typerDeduper),
