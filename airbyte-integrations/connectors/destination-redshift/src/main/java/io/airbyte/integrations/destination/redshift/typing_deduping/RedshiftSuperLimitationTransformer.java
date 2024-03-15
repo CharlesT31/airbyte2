@@ -8,7 +8,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.annotations.VisibleForTesting;
-import io.airbyte.cdk.integrations.destination_async.deser.StreamAwareDataTransformer;
+import io.airbyte.cdk.integrations.destination.async.deser.StreamAwareDataTransformer;
 import io.airbyte.commons.json.Jsons;
 import io.airbyte.integrations.base.destination.typing_deduping.ColumnId;
 import io.airbyte.integrations.base.destination.typing_deduping.ParsedCatalog;
@@ -31,6 +31,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import kotlin.Pair;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.tuple.ImmutablePair;
 
@@ -55,14 +56,14 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
   }
 
   @Override
-  public ImmutablePair<JsonNode, AirbyteRecordMessageMeta> transform(final StreamDescriptor streamDescriptor,
-                                                                     final JsonNode jsonNode,
-                                                                     final AirbyteRecordMessageMeta airbyteRecordMessageMeta) {
+  public Pair<JsonNode, AirbyteRecordMessageMeta> transform(final StreamDescriptor streamDescriptor,
+                                                            final JsonNode jsonNode,
+                                                            final AirbyteRecordMessageMeta airbyteRecordMessageMeta) {
     return transform(streamDescriptor, jsonNode, airbyteRecordMessageMeta, DEFAULT_VARCHAR_SIZE_LIMIT_PREDICATE, DEFAULT_SUPER_SIZE_LIMIT_PREDICATE);
   }
 
   @VisibleForTesting
-  ImmutablePair<JsonNode, AirbyteRecordMessageMeta> transform(final StreamDescriptor streamDescriptor,
+  Pair<JsonNode, AirbyteRecordMessageMeta> transform(final StreamDescriptor streamDescriptor,
                                                               final JsonNode jsonNode,
                                                               final AirbyteRecordMessageMeta airbyteRecordMessageMeta,
                                                               final Predicate<String> varcharPredicate,
@@ -91,9 +92,7 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
           .withField("all").withChange(Change.NULLED)
           .withReason(Reason.DESTINATION_RECORD_SIZE_LIMITATION));
       changes.addAll(airbyteRecordMessageMeta.getChanges());
-      return new ImmutablePair<>(minimalNode,
-          new AirbyteRecordMessageMeta()
-              .withChanges(changes));
+      return new Pair<>(minimalNode, new AirbyteRecordMessageMeta().withChanges(changes));
     }
     // The underlying list of AirbyteRecordMessageMeta is mutable
     transformationInfo.meta.getChanges().addAll(airbyteRecordMessageMeta.getChanges());
@@ -101,7 +100,7 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
     // We intentionally don't deep copy for transformation to avoid memory bloat.
     // The caller already has the reference of original jsonNode but returning again in
     // case we choose to deepCopy in future for thread-safety.
-    return new ImmutablePair<>(jsonNode, transformationInfo.meta);
+    return new Pair<>(jsonNode, transformationInfo.meta);
   }
 
   private ScalarNodeModification shouldTransformScalarNode(final JsonNode node,

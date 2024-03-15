@@ -35,7 +35,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.IntStream;
-import org.apache.commons.lang3.tuple.ImmutablePair;
+import kotlin.Pair;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -100,17 +100,17 @@ public class RedshiftSuperLimitationTransformerTest {
                 .withField("upstream_field")
                 .withChange(Change.NULLED)
                 .withReason(Reason.PLATFORM_SERIALIZATION_ERROR)));
-    final ImmutablePair<JsonNode, AirbyteRecordMessageMeta> transformed =
+    final Pair<JsonNode, AirbyteRecordMessageMeta> transformed =
         transformer.transform(new StreamDescriptor().withNamespace("test_schema").withName("users_final"), Jsons.jsonNode(testData), upstreamMeta);
     assertTrue(
-        Jsons.serialize(transformed.left).getBytes(StandardCharsets.UTF_8).length < RedshiftSuperLimitationTransformer.REDSHIFT_SUPER_MAX_BYTE_SIZE);
-    assertEquals(2, transformed.right.getChanges().size());
+        Jsons.serialize(transformed.getFirst()).getBytes(StandardCharsets.UTF_8).length < RedshiftSuperLimitationTransformer.REDSHIFT_SUPER_MAX_BYTE_SIZE);
+    assertEquals(2, transformed.getSecond().getChanges().size());
     // Assert that transformation added the change
-    assertEquals("$.column3", transformed.right.getChanges().getFirst().getField());
-    assertEquals(Change.NULLED, transformed.right.getChanges().getFirst().getChange());
-    assertEquals(Reason.DESTINATION_FIELD_SIZE_LIMITATION, transformed.right.getChanges().getFirst().getReason());
+    assertEquals("$.column3", transformed.getSecond().getChanges().getFirst().getField());
+    assertEquals(Change.NULLED, transformed.getSecond().getChanges().getFirst().getChange());
+    assertEquals(Reason.DESTINATION_FIELD_SIZE_LIMITATION, transformed.getSecond().getChanges().getFirst().getReason());
     // Assert that upstream changes are preserved (appended last)
-    assertEquals("upstream_field", transformed.right.getChanges().getLast().getField());
+    assertEquals("upstream_field", transformed.getSecond().getChanges().getLast().getField());
   }
 
   @Test
@@ -127,20 +127,20 @@ public class RedshiftSuperLimitationTransformerTest {
                 .withField("upstream_field")
                 .withChange(Change.NULLED)
                 .withReason(Reason.PLATFORM_SERIALIZATION_ERROR)));
-    final ImmutablePair<JsonNode, AirbyteRecordMessageMeta> transformed =
+    final Pair<JsonNode, AirbyteRecordMessageMeta> transformed =
         transformer.transform(new StreamDescriptor().withNamespace("test_schema").withName("users_final"), Jsons.jsonNode(testData), upstreamMeta);
     // Verify PKs are preserved.
-    assertNotNull(transformed.left.get("column1"));
-    assertNotNull(transformed.left.get("column1"));
+    assertNotNull(transformed.getFirst().get("column1"));
+    assertNotNull(transformed.getFirst().get("column1"));
     assertTrue(
-        Jsons.serialize(transformed.left).getBytes(StandardCharsets.UTF_8).length < RedshiftSuperLimitationTransformer.REDSHIFT_SUPER_MAX_BYTE_SIZE);
-    assertEquals(2, transformed.right.getChanges().size());
+        Jsons.serialize(transformed.getSecond()).getBytes(StandardCharsets.UTF_8).length < RedshiftSuperLimitationTransformer.REDSHIFT_SUPER_MAX_BYTE_SIZE);
+    assertEquals(2, transformed.getSecond().getChanges().size());
     // Assert that transformation added the change
-    assertEquals("all", transformed.right.getChanges().getFirst().getField());
-    assertEquals(Change.NULLED, transformed.right.getChanges().getFirst().getChange());
-    assertEquals(Reason.DESTINATION_RECORD_SIZE_LIMITATION, transformed.right.getChanges().getFirst().getReason());
+    assertEquals("all", transformed.getSecond().getChanges().getFirst().getField());
+    assertEquals(Change.NULLED, transformed.getSecond().getChanges().getFirst().getChange());
+    assertEquals(Reason.DESTINATION_RECORD_SIZE_LIMITATION, transformed.getSecond().getChanges().getFirst().getReason());
     // Assert that upstream changes are preserved (appended last)
-    assertEquals("upstream_field", transformed.right.getChanges().getLast().getField());
+    assertEquals("upstream_field", transformed.getSecond().getChanges().getLast().getField());
   }
 
   private String getLargeString(int kbSize) {
