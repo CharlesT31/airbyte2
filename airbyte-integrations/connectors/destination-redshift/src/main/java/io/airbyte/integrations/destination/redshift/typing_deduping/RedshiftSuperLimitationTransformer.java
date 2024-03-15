@@ -1,0 +1,238 @@
+/*
+ * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ */
+
+package io.airbyte.integrations.destination.redshift.typing_deduping;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.common.annotations.VisibleForTesting;
+import io.airbyte.cdk.integrations.destination_async.deser.StreamAwareDataTransformer;
+import io.airbyte.commons.json.Jsons;
+import io.airbyte.integrations.base.destination.typing_deduping.ColumnId;
+import io.airbyte.integrations.base.destination.typing_deduping.ParsedCatalog;
+import io.airbyte.integrations.base.destination.typing_deduping.StreamConfig;
+import io.airbyte.protocol.models.v0.AirbyteRecordMessageMeta;
+import io.airbyte.protocol.models.v0.AirbyteRecordMessageMetaChange;
+import io.airbyte.protocol.models.v0.AirbyteRecordMessageMetaChange.Change;
+import io.airbyte.protocol.models.v0.AirbyteRecordMessageMetaChange.Reason;
+import io.airbyte.protocol.models.v0.DestinationSyncMode;
+import io.airbyte.protocol.models.v0.StreamDescriptor;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.tuple.ImmutablePair;
+
+@Slf4j
+public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransformer {
+
+  private record ScalarNodeModification(int size, int removedSize, boolean shouldNull) {}
+
+  public record TransformationInfo(int originalBytes, int removedBytes, JsonNode node, AirbyteRecordMessageMeta meta) {}
+
+  public static final int REDSHIFT_VARCHAR_MAX_BYTE_SIZE = 65535;
+  public static final int REDSHIFT_SUPER_MAX_BYTE_SIZE = 16 * 1024 * 1024;
+
+  static Predicate<String> DEFAULT_VARCHAR_SIZE_LIMIT_PREDICATE = text -> getByteSize(text) > REDSHIFT_VARCHAR_MAX_BYTE_SIZE;
+  static Predicate<Integer> DEFAULT_SUPER_SIZE_LIMIT_PREDICATE = size -> size > REDSHIFT_SUPER_MAX_BYTE_SIZE;
+
+  private final ParsedCatalog parsedCatalog;
+
+  public RedshiftSuperLimitationTransformer(ParsedCatalog parsedCatalog) {
+    this.parsedCatalog = parsedCatalog;
+
+  }
+
+  @Override
+  public ImmutablePair<JsonNode, AirbyteRecordMessageMeta> transform(final StreamDescriptor streamDescriptor,
+                                                                     final JsonNode jsonNode,
+                                                                     final AirbyteRecordMessageMeta airbyteRecordMessageMeta) {
+    return transform(streamDescriptor, jsonNode, airbyteRecordMessageMeta, DEFAULT_VARCHAR_SIZE_LIMIT_PREDICATE, DEFAULT_SUPER_SIZE_LIMIT_PREDICATE);
+  }
+
+  @VisibleForTesting
+  ImmutablePair<JsonNode, AirbyteRecordMessageMeta> transform(final StreamDescriptor streamDescriptor,
+                                                              final JsonNode jsonNode,
+                                                              final AirbyteRecordMessageMeta airbyteRecordMessageMeta,
+                                                              final Predicate<String> varcharPredicate,
+                                                              final Predicate<Integer> recordSizePredicate) {
+    final StreamConfig streamConfig = parsedCatalog.getStream(streamDescriptor.getNamespace(), streamDescriptor.getName());
+    final Optional<String> cursorField = streamConfig.cursor().map(ColumnId::originalName);
+    // convert List<ColumnId> to Set<ColumnId> for faster lookup
+    final Set<String> primaryKeys = streamConfig.primaryKey().stream().map(ColumnId::originalName).collect(Collectors.toSet());
+    final DestinationSyncMode syncMode = streamConfig.destinationSyncMode();
+    final TransformationInfo transformationInfo = transformNodes(jsonNode, varcharPredicate);
+    final int originalBytes = transformationInfo.originalBytes;
+    final int actualBytes = transformationInfo.originalBytes - transformationInfo.removedBytes;
+    // We also test for size after removedBytes in case there is few offending
+    // values causing the record to bloat.
+    if (recordSizePredicate.test(originalBytes) || recordSizePredicate.test(actualBytes)) {
+      // If we have reached here with a bunch of small varchars constituted to becoming a large record,
+      // person using Redshift for this data should re-evaluate life choices.
+      log.info("Record size before transformation {}, after transformation {} bytes exceeds 16MB limit", originalBytes, actualBytes);
+      final JsonNode minimalNode = constructMinimalJsonWithPks(jsonNode, primaryKeys, cursorField);
+      if (minimalNode.isEmpty() && syncMode == DestinationSyncMode.APPEND_DEDUP) {
+        // Fail the sync if PKs are missing in DEDUPE, no point sending an empty record to destination.
+        throw new RuntimeException("Record exceeds size limit, cannot transform without PrimaryKeys in DEDUPE sync");
+      }
+      return new ImmutablePair<>(minimalNode, null);
+    }
+    // The underlying list of AirbyteRecordMessageMeta is mutable
+    transformationInfo.meta.getChanges().addAll(airbyteRecordMessageMeta.getChanges());
+
+    // We intentionally don't deep copy for transformation to avoid memory bloat.
+    // The caller already has the reference of original jsonNode but returning again in
+    // case we choose to deepCopy in future for thread-safety.
+    return new ImmutablePair<>(jsonNode, transformationInfo.meta);
+  }
+
+  private ScalarNodeModification shouldTransformScalarNode(final JsonNode node,
+                                                           final Predicate<String> textNodePredicate) {
+    final int bytes;
+    if (node.isTextual()) {
+      final int originalBytes = getByteSize(node.asText()) + 2; // for quotes
+      if (textNodePredicate.test(node.asText())) {
+        return new ScalarNodeModification(originalBytes, // size before nulling
+            originalBytes - 4, // account 4 bytes for null string
+            true);
+      }
+      bytes = originalBytes;
+    } else if (node.isNumber()) {
+      // Serialize exactly for numbers to account for Scientific notation converted to full value.
+      bytes = getByteSize(Jsons.serialize(node));
+    } else if (node.isBoolean()) {
+      bytes = getByteSize(node.toString());
+    } else if (node.isNull()) {
+      bytes = 4; // for "null"
+    } else {
+      bytes = 0;
+    }
+    return new ScalarNodeModification(bytes, // For all other types, just return bytes
+        0, // account 4 bytes for null string
+        false);
+  }
+
+  private static int getByteSize(final String value) {
+    return value.getBytes(StandardCharsets.UTF_8).length;
+  }
+
+  @VisibleForTesting
+  TransformationInfo transformNodes(final JsonNode rootNode,
+                                    final Predicate<String> textNodePredicate) {
+
+    // Walk the tree and transform Varchars that exceed the limit
+    // We are intentionally not checking the whole size upfront to check if it exceeds 16MB limit to
+    // optimize
+    // for worst case.
+    int originalBytes = 0;
+    int removedBytes = 0;
+    // We keep track of the json path key for adding to airbyte changes.
+    final Deque<ImmutablePair<String, JsonNode>> stack = new ArrayDeque<>();
+    final List<AirbyteRecordMessageMetaChange> changes = new ArrayList<>();
+
+    // This was intentionally done using Iterative DFS to avoid stack overflow for large records.
+    // This will ensure we are allocating on heap and not on stack.
+    stack.push(ImmutablePair.of("$", rootNode));
+    while (!stack.isEmpty()) {
+      final ImmutablePair<String, JsonNode> jsonPathNodePair = stack.pop();
+      final JsonNode currentNode = jsonPathNodePair.right;
+      if (currentNode.isObject()) {
+        originalBytes += getByteSize("{}");
+        final Iterator<Entry<String, JsonNode>> fields = currentNode.fields();
+        while (fields.hasNext()) {
+          final Map.Entry<String, JsonNode> field = fields.next();
+          originalBytes += getByteSize(field.getKey()) + getByteSize("\"\":,"); // for quotes, colon, comma
+          final String jsonPathKey = jsonPathNodePair.left + "." + field.getKey();
+          if (field.getValue().isContainerNode())
+            // Push only non-scalar nodes to stack. For scalar nodes, we need reference of parent to do in-place
+            // update.
+            stack.push(ImmutablePair.of(jsonPathKey, field.getValue()));
+          else {
+            final ScalarNodeModification shouldTransform = shouldTransformScalarNode(field.getValue(), textNodePredicate);
+            if (shouldTransform.shouldNull()) {
+              removedBytes += shouldTransform.removedSize;
+              // DO NOT do this if this code every modified to a multithreaded call stack
+              field.setValue(Jsons.jsonNode(null));
+              changes.add(new AirbyteRecordMessageMetaChange()
+                  .withField(jsonPathKey)
+                  .withChange(Change.NULLED)
+                  .withReason(Reason.DESTINATION_FIELD_SIZE_LIMITATION));
+            }
+            originalBytes += shouldTransform.size;
+          }
+        }
+        originalBytes -= 1; // remove extra comma from last key-value pair
+      } else if (currentNode.isArray()) {
+        originalBytes += getByteSize("[]");
+        final ArrayNode arrayNode = (ArrayNode) currentNode;
+        // We cannot use foreach here as we need to update the array in place.
+        for (int i = 0; i < arrayNode.size(); i++) {
+          final JsonNode childNode = arrayNode.get(i);
+          final String jsonPathKey = jsonPathNodePair.left + "[" + i + "]";
+          if (childNode.isContainerNode())
+            stack.push(ImmutablePair.of(jsonPathKey, childNode));
+          else {
+            final ScalarNodeModification shouldTransform = shouldTransformScalarNode(childNode, textNodePredicate);
+            if (shouldTransform.shouldNull()) {
+              removedBytes += shouldTransform.removedSize;
+              // DO NOT do this if this code every modified to a multithreaded call stack
+              arrayNode.set(i, Jsons.jsonNode(null));
+              changes.add(new AirbyteRecordMessageMetaChange()
+                  .withField(jsonPathKey)
+                  .withChange(Change.NULLED)
+                  .withReason(Reason.DESTINATION_FIELD_SIZE_LIMITATION));
+            }
+            originalBytes += shouldTransform.size;
+          }
+        }
+        originalBytes += !currentNode.isEmpty() ? currentNode.size() - 1 : 0; // for commas
+      } else { // Top level scalar node is a valid json
+        originalBytes += shouldTransformScalarNode(currentNode, textNodePredicate).size();
+      }
+    }
+
+    if (removedBytes != 0) {
+      log.info("Original record size {} bytes, Modified record size {} bytes", originalBytes, (originalBytes - removedBytes));
+    }
+    return new TransformationInfo(originalBytes, removedBytes, rootNode, new AirbyteRecordMessageMeta().withChanges(changes));
+  }
+
+  @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
+  private JsonNode constructMinimalJsonWithPks(JsonNode rootNode, Set<String> primaryKeys, Optional<String> cursorField) {
+    final ObjectNode minimalNode = (ObjectNode) Jsons.emptyObject();
+    // We only iterate for top-level fields in the root object, since we only support PKs and cursor in
+    // top level keys.
+    if (rootNode.isObject()) {
+      final Iterator<Entry<String, JsonNode>> fields = rootNode.fields();
+      while (fields.hasNext()) {
+        final Map.Entry<String, JsonNode> field = fields.next();
+        if (!field.getValue().isContainerNode()) {
+          if (primaryKeys.contains(field.getKey()) || cursorField.isPresent() && cursorField.get().equals(field.getKey())) {
+            // Make a deepcopy into minimalNode of PKs and cursor fields and values,
+            // without deepcopy, we will re-reference the original Tree's nodes.
+            // god help us if someone set a PK on non-scalar field and it reached this point, only do at root
+            // level
+            minimalNode.set(field.getKey(), field.getValue().deepCopy());
+          }
+        }
+      }
+    } else {
+      log.error("Encountered {} as top level JSON field, this is not supported", rootNode.getNodeType());
+      // This should have caught way before it reaches here. Just additional safety.
+      throw new RuntimeException("Encountered " + rootNode.getNodeType() + " as top level JSON field, this is not supported");
+    }
+    return minimalNode;
+  }
+
+}
