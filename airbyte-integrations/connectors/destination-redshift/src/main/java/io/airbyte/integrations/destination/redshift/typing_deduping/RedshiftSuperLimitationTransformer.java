@@ -96,12 +96,15 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
       changes.add(new AirbyteRecordMessageMetaChange()
           .withField("all").withChange(Change.NULLED)
           .withReason(Reason.DESTINATION_RECORD_SIZE_LIMITATION));
-      changes.addAll(airbyteRecordMessageMeta.getChanges());
+      if (airbyteRecordMessageMeta != null && airbyteRecordMessageMeta.getChanges() != null) {
+        changes.addAll(airbyteRecordMessageMeta.getChanges());
+      }
       return new Pair<>(minimalNode, new AirbyteRecordMessageMeta().withChanges(changes));
     }
-    // The underlying list of AirbyteRecordMessageMeta is mutable
-    transformationInfo.meta.getChanges().addAll(airbyteRecordMessageMeta.getChanges());
-
+    if (airbyteRecordMessageMeta != null && airbyteRecordMessageMeta.getChanges() != null) {
+      // The underlying list of AirbyteRecordMessageMeta is mutable
+      transformationInfo.meta.getChanges().addAll(airbyteRecordMessageMeta.getChanges());
+    }
     // We intentionally don't deep copy for transformation to avoid memory bloat.
     // The caller already has the reference of original jsonNode but returning again in
     // case we choose to deepCopy in future for thread-safety.

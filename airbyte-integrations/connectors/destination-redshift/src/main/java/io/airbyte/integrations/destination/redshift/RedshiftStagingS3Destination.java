@@ -56,6 +56,7 @@ import io.airbyte.integrations.destination.redshift.typing_deduping.RedshiftDest
 import io.airbyte.integrations.destination.redshift.typing_deduping.RedshiftRawTableAirbyteMetaMigration;
 import io.airbyte.integrations.destination.redshift.typing_deduping.RedshiftSqlGenerator;
 import io.airbyte.integrations.destination.redshift.typing_deduping.RedshiftState;
+import io.airbyte.integrations.destination.redshift.typing_deduping.RedshiftSuperLimitationTransformer;
 import io.airbyte.integrations.destination.redshift.util.RedshiftUtil;
 import io.airbyte.protocol.models.v0.AirbyteConnectionStatus;
 import io.airbyte.protocol.models.v0.AirbyteConnectionStatus.Status;
@@ -257,6 +258,7 @@ public class RedshiftStagingS3Destination extends AbstractJdbcDestination<Redshi
       typerDeduper =
           new DefaultTyperDeduper<>(sqlGenerator, redshiftDestinationHandler, parsedCatalog, migrator, v2TableMigrator, redshiftMigrations);
     }
+    final RedshiftSuperLimitationTransformer transformer = new RedshiftSuperLimitationTransformer(parsedCatalog, defaultNamespace);
     return StagingConsumerFactory.builder(
         outputRecordCollector,
         database,
@@ -269,7 +271,10 @@ public class RedshiftStagingS3Destination extends AbstractJdbcDestination<Redshi
         typerDeduper,
         parsedCatalog,
         defaultNamespace,
-        true).build().createAsync();
+        true)
+        .setDataTransformer(transformer)
+        .build()
+        .createAsync();
   }
 
   /**
