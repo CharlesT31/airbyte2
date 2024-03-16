@@ -44,7 +44,7 @@
     "name": "Acme Corporation",
     "address": "123 Main St, Anytown, USA",
     "founded_year": 2000,
-    "revenue": 1.5e7,
+    "revenue": 1.23456789987654321e8,
     "stock_price": 5.25e3,
     "employees_count": 5000,
     "ceo": {

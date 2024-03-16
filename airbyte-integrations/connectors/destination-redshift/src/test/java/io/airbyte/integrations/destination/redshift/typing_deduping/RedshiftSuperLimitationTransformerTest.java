@@ -82,6 +82,7 @@ public class RedshiftSuperLimitationTransformerTest {
     assertEquals(jacksonDeserializationSize, transformationInfo.originalBytes());
     assertEquals(jacksonDeserializeSizeAfterTransform, transformationInfo.originalBytes() - transformationInfo.removedBytes());
     System.out.println(transformationInfo.meta());
+    System.out.println(Jsons.serialize(jsonNode));
   }
 
   @Test

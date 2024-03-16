@@ -162,6 +162,7 @@ public abstract class AbstractRedshiftTypingDedupingTest extends JdbcTypingDedup
     runSync(catalog, List.of(message1, message2));
 
     // Add verification.
+
   }
 
   private String generateBigString(final int additionalChars) {
