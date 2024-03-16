@@ -27,6 +27,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Predicate;
@@ -34,6 +35,7 @@ import java.util.stream.Collectors;
 import kotlin.Pair;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.tuple.ImmutablePair;
+import org.jetbrains.annotations.NotNull;
 
 @Slf4j
 public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransformer {
@@ -45,39 +47,42 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
   public static final int REDSHIFT_VARCHAR_MAX_BYTE_SIZE = 65535;
   public static final int REDSHIFT_SUPER_MAX_BYTE_SIZE = 16 * 1024 * 1024;
 
-  final static Predicate<String> DEFAULT_VARCHAR_SIZE_LIMIT_PREDICATE = text -> getByteSize(text) > REDSHIFT_VARCHAR_MAX_BYTE_SIZE;
-  final static Predicate<Integer> DEFAULT_SUPER_SIZE_LIMIT_PREDICATE = size -> size > REDSHIFT_SUPER_MAX_BYTE_SIZE;
+  static final Predicate<String> DEFAULT_VARCHAR_GT_THAN_64K_PREDICATE = text -> getByteSize(text) > REDSHIFT_VARCHAR_MAX_BYTE_SIZE;
+  static final Predicate<Integer> DEFAULT_RECORD_SIZE_GT_THAN_16M_PREDICATE = size -> size > REDSHIFT_SUPER_MAX_BYTE_SIZE;
+
+  private static final int CURLY_BRACES_BYTE_SIZE = getByteSize("{}");
+  private static final int SQUARE_BRACKETS_BYTE_SIZE = getByteSize("[]");
+  private static final int OBJECT_COLON_QUOTES_COMMA_BYTE_SIZE = getByteSize("\"\":,");
 
   private final ParsedCatalog parsedCatalog;
 
-  public RedshiftSuperLimitationTransformer(ParsedCatalog parsedCatalog) {
+  private final String defaultNamespace;
+
+  public RedshiftSuperLimitationTransformer(final ParsedCatalog parsedCatalog, final String defaultNamespace) {
     this.parsedCatalog = parsedCatalog;
+    Objects.requireNonNull(defaultNamespace);
+    this.defaultNamespace = defaultNamespace;
 
   }
 
+  @NotNull
   @Override
   public Pair<JsonNode, AirbyteRecordMessageMeta> transform(final StreamDescriptor streamDescriptor,
                                                             final JsonNode jsonNode,
                                                             final AirbyteRecordMessageMeta airbyteRecordMessageMeta) {
-    return transform(streamDescriptor, jsonNode, airbyteRecordMessageMeta, DEFAULT_VARCHAR_SIZE_LIMIT_PREDICATE, DEFAULT_SUPER_SIZE_LIMIT_PREDICATE);
-  }
-
-  @VisibleForTesting
-  Pair<JsonNode, AirbyteRecordMessageMeta> transform(final StreamDescriptor streamDescriptor,
-                                                              final JsonNode jsonNode,
-                                                              final AirbyteRecordMessageMeta airbyteRecordMessageMeta,
-                                                              final Predicate<String> varcharPredicate,
-                                                              final Predicate<Integer> recordSizePredicate) {
-    final StreamConfig streamConfig = parsedCatalog.getStream(streamDescriptor.getNamespace(), streamDescriptor.getName());
+    final String namespace =
+        (streamDescriptor.getNamespace() != null && !streamDescriptor.getNamespace().isEmpty()) ? streamDescriptor.getNamespace() : defaultNamespace;
+    final StreamConfig streamConfig = parsedCatalog.getStream(namespace, streamDescriptor.getName());
     final Optional<String> cursorField = streamConfig.cursor().map(ColumnId::originalName);
     // convert List<ColumnId> to Set<ColumnId> for faster lookup
     final Set<String> primaryKeys = streamConfig.primaryKey().stream().map(ColumnId::originalName).collect(Collectors.toSet());
     final DestinationSyncMode syncMode = streamConfig.destinationSyncMode();
-    final TransformationInfo transformationInfo = transformNodes(jsonNode, varcharPredicate);
+    final TransformationInfo transformationInfo = transformNodes(jsonNode, DEFAULT_VARCHAR_GT_THAN_64K_PREDICATE);
     final int originalBytes = transformationInfo.originalBytes;
     final int transformedBytes = transformationInfo.originalBytes - transformationInfo.removedBytes;
     // We check if the transformedBytes has solved the record limit.
-    if (recordSizePredicate.test(originalBytes) && recordSizePredicate.test(transformedBytes)) {
+    if (DEFAULT_RECORD_SIZE_GT_THAN_16M_PREDICATE.test(originalBytes)
+        && DEFAULT_RECORD_SIZE_GT_THAN_16M_PREDICATE.test(transformedBytes)) {
       // If we have reached here with a bunch of small varchars constituted to becoming a large record,
       // person using Redshift for this data should re-evaluate life choices.
       log.info("Record size before transformation {}, after transformation {} bytes exceeds 16MB limit", originalBytes, transformedBytes);
@@ -142,7 +147,7 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
     // optimize for best case.
     int originalBytes = 0;
     int removedBytes = 0;
-    // We keep track of the json path key for adding to airbyte changes.
+    // We accumulate nested keys in jsonPath format for adding to airbyte changes.
     final Deque<ImmutablePair<String, JsonNode>> stack = new ArrayDeque<>();
     final List<AirbyteRecordMessageMetaChange> changes = new ArrayList<>();
 
@@ -153,17 +158,18 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
       final ImmutablePair<String, JsonNode> jsonPathNodePair = stack.pop();
       final JsonNode currentNode = jsonPathNodePair.right;
       if (currentNode.isObject()) {
-        originalBytes += getByteSize("{}");
+        originalBytes += CURLY_BRACES_BYTE_SIZE;
         final Iterator<Entry<String, JsonNode>> fields = currentNode.fields();
         while (fields.hasNext()) {
           final Map.Entry<String, JsonNode> field = fields.next();
-          originalBytes += getByteSize(field.getKey()) + getByteSize("\"\":,"); // for quotes, colon, comma
-          final String jsonPathKey = jsonPathNodePair.left + "." + field.getKey();
-          if (field.getValue().isContainerNode())
-            // Push only non-scalar nodes to stack. For scalar nodes, we need reference of parent to do in-place
-            // update.
+          originalBytes += getByteSize(field.getKey()) + OBJECT_COLON_QUOTES_COMMA_BYTE_SIZE; // for quotes, colon, comma
+          final String jsonPathKey = String.format("%s.%s", jsonPathNodePair.left, field.getKey());
+          // TODO: Little difficult to unify this logic in Object & Array, find a way later
+          // Push only non-scalar nodes to stack. For scalar nodes, we need reference of parent to do in-place
+          // update.
+          if (field.getValue().isContainerNode()) {
             stack.push(ImmutablePair.of(jsonPathKey, field.getValue()));
-          else {
+          } else {
             final ScalarNodeModification shouldTransform = shouldTransformScalarNode(field.getValue(), textNodePredicate);
             if (shouldTransform.shouldNull()) {
               removedBytes += shouldTransform.removedSize;
@@ -179,12 +185,12 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
         }
         originalBytes -= 1; // remove extra comma from last key-value pair
       } else if (currentNode.isArray()) {
-        originalBytes += getByteSize("[]");
+        originalBytes += SQUARE_BRACKETS_BYTE_SIZE;
         final ArrayNode arrayNode = (ArrayNode) currentNode;
         // We cannot use foreach here as we need to update the array in place.
         for (int i = 0; i < arrayNode.size(); i++) {
           final JsonNode childNode = arrayNode.get(i);
-          final String jsonPathKey = jsonPathNodePair.left + "[" + i + "]";
+          final String jsonPathKey = String.format("%s[%d]", jsonPathNodePair.left, i);
           if (childNode.isContainerNode())
             stack.push(ImmutablePair.of(jsonPathKey, childNode));
           else {

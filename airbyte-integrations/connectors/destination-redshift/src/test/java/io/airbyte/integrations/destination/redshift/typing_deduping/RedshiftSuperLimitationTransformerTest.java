@@ -6,6 +6,7 @@ package io.airbyte.integrations.destination.redshift.typing_deduping;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -62,7 +63,7 @@ public class RedshiftSuperLimitationTransformerTest {
         Optional.empty(),
         columns);
     final ParsedCatalog parsedCatalog = new ParsedCatalog(List.of(streamConfig));
-    transformer = new RedshiftSuperLimitationTransformer(parsedCatalog);
+    transformer = new RedshiftSuperLimitationTransformer(parsedCatalog, "test_schema");
   }
 
   @Test
@@ -103,7 +104,8 @@ public class RedshiftSuperLimitationTransformerTest {
     final Pair<JsonNode, AirbyteRecordMessageMeta> transformed =
         transformer.transform(new StreamDescriptor().withNamespace("test_schema").withName("users_final"), Jsons.jsonNode(testData), upstreamMeta);
     assertTrue(
-        Jsons.serialize(transformed.getFirst()).getBytes(StandardCharsets.UTF_8).length < RedshiftSuperLimitationTransformer.REDSHIFT_SUPER_MAX_BYTE_SIZE);
+        Jsons.serialize(transformed.getFirst())
+            .getBytes(StandardCharsets.UTF_8).length < RedshiftSuperLimitationTransformer.REDSHIFT_SUPER_MAX_BYTE_SIZE);
     assertEquals(2, transformed.getSecond().getChanges().size());
     // Assert that transformation added the change
     assertEquals("$.column3", transformed.getSecond().getChanges().getFirst().getField());
@@ -115,10 +117,8 @@ public class RedshiftSuperLimitationTransformerTest {
 
   @Test
   public void testRedshiftSuperLimit_ShouldRemoveWholeRecord() {
-    // We generate 1020 16Kb strings and 1 64Kb string + 2 uuids.
-    // Removing the 64kb will make it fall below the 16MB limit & offending varchar removed too.
     final Map<String, String> testData = new HashMap<>();
-    // Add 16Kb strings from column 3 to 1024 in testData
+    // Add 16Kb strings from column 1 to 1024 in testData -> total > 16MB
     IntStream.range(1, 1025).forEach(i -> testData.put("column" + i, getLargeString(16)));
 
     AirbyteRecordMessageMeta upstreamMeta = new AirbyteRecordMessageMeta()
@@ -133,7 +133,8 @@ public class RedshiftSuperLimitationTransformerTest {
     assertNotNull(transformed.getFirst().get("column1"));
     assertNotNull(transformed.getFirst().get("column1"));
     assertTrue(
-        Jsons.serialize(transformed.getSecond()).getBytes(StandardCharsets.UTF_8).length < RedshiftSuperLimitationTransformer.REDSHIFT_SUPER_MAX_BYTE_SIZE);
+        Jsons.serialize(transformed.getSecond())
+            .getBytes(StandardCharsets.UTF_8).length < RedshiftSuperLimitationTransformer.REDSHIFT_SUPER_MAX_BYTE_SIZE);
     assertEquals(2, transformed.getSecond().getChanges().size());
     // Assert that transformation added the change
     assertEquals("all", transformed.getSecond().getChanges().getFirst().getField());
@@ -141,6 +142,26 @@ public class RedshiftSuperLimitationTransformerTest {
     assertEquals(Reason.DESTINATION_RECORD_SIZE_LIMITATION, transformed.getSecond().getChanges().getFirst().getReason());
     // Assert that upstream changes are preserved (appended last)
     assertEquals("upstream_field", transformed.getSecond().getChanges().getLast().getField());
+  }
+
+  @Test
+  public void testRedshiftSuperLimit_ShouldFailOnPKMissing() {
+    final Map<String, String> testData = new HashMap<>();
+    // Add 16Kb strings from column 3 to 1027 in testData, 1 & 2 are pks missing
+    IntStream.range(3, 1028).forEach(i -> testData.put("column" + i, getLargeString(16)));
+
+    AirbyteRecordMessageMeta upstreamMeta = new AirbyteRecordMessageMeta()
+        .withChanges(List.of(
+            new AirbyteRecordMessageMetaChange()
+                .withField("upstream_field")
+                .withChange(Change.NULLED)
+                .withReason(Reason.PLATFORM_SERIALIZATION_ERROR)));
+    final Exception ex = assertThrows(RuntimeException.class,
+        () -> transformer.transform(
+            new StreamDescriptor().withNamespace("test_schema").withName("users_final"), Jsons.jsonNode(testData),
+            upstreamMeta));
+
+    assertEquals("Record exceeds size limit, cannot transform without PrimaryKeys in DEDUPE sync", ex.getMessage());
   }
 
   private String getLargeString(int kbSize) {
