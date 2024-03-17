@@ -25,6 +25,7 @@ import io.airbyte.cdk.integrations.base.SerializedAirbyteMessageConsumer;
 import io.airbyte.cdk.integrations.base.TypingAndDedupingFlag;
 import io.airbyte.cdk.integrations.base.ssh.SshWrappedDestination;
 import io.airbyte.cdk.integrations.destination.NamingConventionTransformer;
+import io.airbyte.cdk.integrations.destination.async.deser.StreamAwareDataTransformer;
 import io.airbyte.cdk.integrations.destination.jdbc.AbstractJdbcDestination;
 import io.airbyte.cdk.integrations.destination.jdbc.typing_deduping.JdbcDestinationHandler;
 import io.airbyte.cdk.integrations.destination.jdbc.typing_deduping.JdbcSqlGenerator;
@@ -199,6 +200,13 @@ public class RedshiftStagingS3Destination extends AbstractJdbcDestination<Redshi
   }
 
   @Override
+  protected StreamAwareDataTransformer getDataTransformer(ParsedCatalog parsedCatalog, String defaultNamespace) {
+    // Redundant override to keep in consistent with InsertDestination. TODO: Unify these 2 classes with
+    // composition.
+    return new RedshiftSuperLimitationTransformer(parsedCatalog, defaultNamespace);
+  }
+
+  @Override
   @Deprecated
   public AirbyteMessageConsumer getConsumer(final JsonNode config,
                                             final ConfiguredAirbyteCatalog catalog,
@@ -258,7 +266,7 @@ public class RedshiftStagingS3Destination extends AbstractJdbcDestination<Redshi
       typerDeduper =
           new DefaultTyperDeduper<>(sqlGenerator, redshiftDestinationHandler, parsedCatalog, migrator, v2TableMigrator, redshiftMigrations);
     }
-    final RedshiftSuperLimitationTransformer transformer = new RedshiftSuperLimitationTransformer(parsedCatalog, defaultNamespace);
+
     return StagingConsumerFactory.builder(
         outputRecordCollector,
         database,
@@ -272,7 +280,7 @@ public class RedshiftStagingS3Destination extends AbstractJdbcDestination<Redshi
         parsedCatalog,
         defaultNamespace,
         true)
-        .setDataTransformer(transformer)
+        .setDataTransformer(getDataTransformer(parsedCatalog, defaultNamespace))
         .build()
         .createAsync();
   }

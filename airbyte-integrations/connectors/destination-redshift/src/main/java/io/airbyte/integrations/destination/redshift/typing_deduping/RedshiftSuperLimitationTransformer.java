@@ -70,6 +70,8 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
   public Pair<JsonNode, AirbyteRecordMessageMeta> transform(final StreamDescriptor streamDescriptor,
                                                             final JsonNode jsonNode,
                                                             final AirbyteRecordMessageMeta airbyteRecordMessageMeta) {
+    final long startTime = System.currentTimeMillis();
+    log.debug("Traversing the record to NULL fields for redshift size limitations");
     final String namespace =
         (streamDescriptor.getNamespace() != null && !streamDescriptor.getNamespace().isEmpty()) ? streamDescriptor.getNamespace() : defaultNamespace;
     final StreamConfig streamConfig = parsedCatalog.getStream(namespace, streamDescriptor.getName());
@@ -81,11 +83,12 @@ public class RedshiftSuperLimitationTransformer implements StreamAwareDataTransf
     final int originalBytes = transformationInfo.originalBytes;
     final int transformedBytes = transformationInfo.originalBytes - transformationInfo.removedBytes;
     // We check if the transformedBytes has solved the record limit.
+    log.debug("Traversal complete in {} ms", System.currentTimeMillis() - startTime);
     if (DEFAULT_RECORD_SIZE_GT_THAN_16M_PREDICATE.test(originalBytes)
         && DEFAULT_RECORD_SIZE_GT_THAN_16M_PREDICATE.test(transformedBytes)) {
       // If we have reached here with a bunch of small varchars constituted to becoming a large record,
       // person using Redshift for this data should re-evaluate life choices.
-      log.info("Record size before transformation {}, after transformation {} bytes exceeds 16MB limit", originalBytes, transformedBytes);
+      log.warn("Record size before transformation {}, after transformation {} bytes exceeds 16MB limit", originalBytes, transformedBytes);
       final JsonNode minimalNode = constructMinimalJsonWithPks(jsonNode, primaryKeys, cursorField);
       if (minimalNode.isEmpty() && syncMode == DestinationSyncMode.APPEND_DEDUP) {
         // Fail the sync if PKs are missing in DEDUPE, no point sending an empty record to destination.

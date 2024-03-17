@@ -119,7 +119,7 @@ public abstract class AbstractRedshiftTypingDedupingTest extends JdbcTypingDedup
                                  "id2": 200,
                                  "updated_at": "2000-01-01T00:00:00Z",
                                  "_ab_cdc_deleted_at": null,
-                                 "name": "Alice",
+                                 "name": "PLACE_HOLDER",
                                  "address": {"city": "San Francisco", "state": "CA"}}
                              }
                            }
@@ -129,12 +129,12 @@ public abstract class AbstractRedshiftTypingDedupingTest extends JdbcTypingDedup
                              "record":{
                                "emitted_at": 1000,
                                "data": {
-                                 "id1": 1,
-                                 "id2": 200,
+                                 "id1": 2,
+                                 "id2": 201,
                                  "updated_at": "2000-01-01T00:00:00Z",
                                  "_ab_cdc_deleted_at": null,
-                                 "name": "Alice",
-                                 "address": {"city": "San Francisco", "state": "CA"}}
+                                 "name": "PLACE_HOLDER",
+                                 "address": {"city": "New York", "state": "NY"}}
                              }
                            }
                            """;
@@ -152,16 +152,21 @@ public abstract class AbstractRedshiftTypingDedupingTest extends JdbcTypingDedup
     message1.getRecord().setNamespace(streamNamespace);
     message1.getRecord().setStream(streamName);
     ((ObjectNode) message1.getRecord().getData()).put("name", largeString1);
-    final AirbyteMessage message2 = Jsons.deserialize(record1, AirbyteMessage.class);
+    final AirbyteMessage message2 = Jsons.deserialize(record2, AirbyteMessage.class);
     message2.getRecord().setNamespace(streamNamespace);
     message2.getRecord().setStream(streamName);
     ((ObjectNode) message2.getRecord().getData()).put("name", largeString2);
-    System.out.println(message2.getRecord().getData().size());
 
     // message1 should be preserved which is just on limit, message2 should be nulled.
     runSync(catalog, List.of(message1, message2));
 
     // Add verification.
+    final List<JsonNode> expectedRawRecords = readRecords("dat/sync1_recordnull_expectedrecords_raw.jsonl");
+    final List<JsonNode> expectedFinalRecords = readRecords("dat/sync1_recordnull_expectedrecords_final.jsonl");
+    // Only replace for first record, second record should be nulled by transformer.
+    ((ObjectNode) expectedRawRecords.get(0).get("_airbyte_data")).put("name", largeString1);
+    ((ObjectNode) expectedFinalRecords.get(0)).put("name", largeString1);
+    verifySyncResult(expectedRawRecords, expectedFinalRecords, disableFinalTableComparison());
 
   }
 

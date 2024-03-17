@@ -125,7 +125,7 @@ public class StagingConsumerFactory extends SerialStagingConsumerFactory {
     private Optional<Long> bufferMemoryLimit = Optional.empty();
     private long optimalBatchSizeBytes = 50 * 1024 * 1024;
 
-    private StreamAwareDataTransformer dataTransformer = new IdentityDataTransformer();
+    private StreamAwareDataTransformer dataTransformer;
 
     private Builder() {}
 
@@ -160,7 +160,7 @@ public class StagingConsumerFactory extends SerialStagingConsumerFactory {
           useDestinationsV2Columns,
           bufferMemoryLimit,
           optimalBatchSizeBytes,
-          dataTransformer);
+          dataTransformer != null ? dataTransformer : new IdentityDataTransformer());
     }
 
   }
@@ -225,7 +225,8 @@ public class StagingConsumerFactory extends SerialStagingConsumerFactory {
         flusher,
         catalog,
         new BufferManager(getMemoryLimit(bufferMemoryLimit)),
-        Optional.ofNullable(defaultNamespace));
+        Optional.ofNullable(defaultNamespace),
+        dataTransformer);
   }
 
   private static long getMemoryLimit(final Optional<Long> bufferMemoryLimit) {
